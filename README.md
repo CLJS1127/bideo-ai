@@ -23,14 +23,14 @@
 
 ```
                   ┌───────────────────────────────────────────────────┐
-                  │  FastAPI (ML 서버)                                 │
-[Spring (web)] ─▶ │  ├─ /api/predictions  ── auction_classifier      │ ─▶  Postgres (BIDEO DB)
-                  │  ├─ /api/recommend    ── creator_recommender     │
+                  │  FastAPI (ML 서버)                                │
+[Spring (web)] ─▶│  ├─ /api/predictions  ── auction_classifier       │ ─▶  Postgres (BIDEO DB)
+                  │  ├─ /api/recommend    ── creator_recommender      │
                   │  ├─ /api/growth       ── follower_growth_predictor│
-                  │  ├─ /api/llm/describe ── OpenAI GPT-4o-mini      │ ─▶  OpenAI API
-                  │  ├─ /api/embed/text   ── OpenAI text-embedding-3 │ ─▶  OpenAI API
-                  │  ├─ /api/search/works ── work_semantic_search    │
-                  │  └─ /api/watermark    ── DWT-DCT (imwatermark)   │
+                  │  ├─ /api/llm/describe ── OpenAI GPT-4o-mini       │ ─▶  OpenAI API
+                  │  ├─ /api/embed/text   ── OpenAI text-embedding-3  │ ─▶  OpenAI API
+                  │  ├─ /api/search/works ── work_semantic_search     │
+                  │  └─ /api/watermark    ── DWT-DCT (imwatermark)    │
                   └───────────────────────────────────────────────────┘
                                      ↑
                             Redis cache (TTL 30s)
