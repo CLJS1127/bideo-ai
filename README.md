@@ -2,8 +2,6 @@
 
 > 본 문서는 **Frontend + Auth + Real-time** 영역의 동작 방식을 코드와 함께 정리한 자료입니다.
 
-🔗 AI 서버 리포: [bideo-ai](https://github.com/your-org/bideo-ai)
-
 ---
 
 ## 🙋 담당 영역 한눈에
