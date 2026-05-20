@@ -22,15 +22,13 @@
 
 ```
                   ┌───────────────────────────────────────────────────┐
-                  │  FastAPI (ML 서버)                                 │
-[Spring (web)] ─▶ │  ├─ /api/predictions  ── auction_classifier      │ ─▶  Postgres (BIDEO DB)
-                  │  ├─ /api/recommend    ── creator_recommender     │
+                  │  FastAPI (ML 서버)                                │
+[Spring (web)] ─▶│  ├─ /api/predictions  ── auction_classifier       │ ─▶  Postgres (BIDEO DB)
+                  │  ├─ /api/recommend    ── creator_recommender      │
                   │  ├─ /api/growth       ── follower_growth_predictor│
-                  │  ├─ /api/llm/describe ── OpenAI GPT-4o-mini      │ ─▶  OpenAI API
-                  │  └─ /api/watermark    ── DWT-DCT (imwatermark)   │
+                  │  ├─ /api/llm/describe ── OpenAI GPT-4o-mini       │ ─▶  OpenAI API
+                  │  └─ /api/watermark    ── DWT-DCT (imwatermark)    │
                   └───────────────────────────────────────────────────┘
-                                     ↑
-                            Redis cache (TTL 30s)
 ```
 
 > 리포에 `/api/embed` (텍스트 임베딩) 도 있지만 현재 Spring 측에서 호출하지 않아 본 문서에서는
