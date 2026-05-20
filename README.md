@@ -1,427 +1,410 @@
-# 🎬 BIDEO — 담당 영역 기술 문서
+# 🤖 BIDEO AI — 모델 설계 & 운영 문서
 
-> 본 문서는 **Frontend + Auth + Real-time** 영역의 동작 방식을 코드와 함께 정리한 자료입니다.
-
----
-
-## 🙋 담당 영역 한눈에
-
-| 영역 | 핵심 책임 |
-|---|---|
-| [1. 인트로 페이지](#1-인트로-페이지-intro-main) | 비로그인 진입 / 서비스 첫인상 |
-| [2. 메인 페이지](#2-메인-페이지-main) | AI 큐레이션 + 갤러리 무한 스크롤 |
-| [3. 로그인 / 회원가입](#3-로그인--회원가입) | JWT 인증, SMS 본인 인증 |
-| [4. 소셜 로그인](#4-소셜-로그인-oauth-20) | OAuth 2.0, 분산 환경 호환 state |
-| [5. 공통 레이아웃](#5-공통-레이아웃) | 다크/라이트 테마, 반응형 |
-| [6. 실시간 채팅](#6-실시간-채팅) | WebSocket + STOMP + RabbitMQ + 무한 스크롤 |
+> 본 문서는 **BIDEO 의 ML 모델 (분류 + 회귀)** 을 어떻게 설계 / 학습 / 서빙했는지 코드와 함께 정리한 자료입니다.
+>
+> 웹 페이지 단위 기능은 별도 [README.md](../../../aws/workspace/bideo/README.md) 참조.
 
 ---
 
-## 1. 인트로 페이지 (`intro-main`)
+## 🙋 담당 모델 한눈에
 
-비로그인 사용자가 가장 먼저 마주하는 화면. 서비스를 모르는 방문자에게 **3초 안에 "왜 BIDEO 인지"** 를 전달하는 게 목표.
+| 모델 | 분류 | 핵심 책임 |
+|---|---|---|
+| [1. 경매 낙찰 분류](#1-경매-낙찰-분류-classification) | Classification (이진) | 메인 "AI PICK" 큐레이션 Top-K 점수 |
+| [2. 작가 팔로워 성장 회귀](#2-작가-팔로워-성장-회귀-regression) | Regression | 마이페이지 N 주 후 팔로워 예측 |
+| [3. 모델 서빙](#3-모델-서빙-fastapi) | Infra | FastAPI + asyncpg + Redis 캐시 |
+| [4. Spring 연동](#4-spring-연동) | Infra | RestTemplate + DTO 매핑 |
 
-### 구성
-
-- **Hero 섹션** — 슬로건과 CTA 버튼
-- **기능 소개** — 거래·커뮤니티·AI 3분할
-- **FAQ 탭패널** — 가입·결제·정산·환불·저작권
-- **푸터** — 약관·문의 링크
-
-### 라우팅
-
-`HomeController` 에서 인증 여부에 따라 라우팅 분기.
-
-```java
-@GetMapping("/")
-public String home(@AuthenticationPrincipal CustomUserDetails user) {
-    return user == null ? "main/intro-main" : "redirect:/main";
-}
 ```
-
-비로그인 → `intro-main.html`, 로그인 사용자는 곧바로 `/main` 으로 이동.
-
-### FAQ 탭 인터랙션
-
-JS 한 줄로 탭 전환을 처리하면서 ARIA 속성도 같이 토글하여 접근성 확보.
-
-```javascript
-tabs.forEach((tab, idx) => tab.addEventListener("click", () => {
-    panels.forEach(p => p.hidden = true);
-    tabs.forEach(t => t.setAttribute("aria-selected", "false"));
-    panels[idx].hidden = false;
-    tab.setAttribute("aria-selected", "true");
-}));
+[Spring (web)] → /api/prediction/* → [FastAPI (ML)] → joblib 모델 + Postgres
+                                          ↑
+                                  Redis cache (TTL 30s)
 ```
 
 ---
 
-## 2. 메인 페이지 (`main`)
+## 1. 경매 낙찰 분류 (Classification)
 
-로그인 사용자의 홈. 두 가지 데이터 흐름이 동시에 동작:
-1. **서버 사이드 렌더링** — Thymeleaf 가 첫 화면을 즉시 표시
-2. **클라이언트 사이드 갱신** — AI 큐레이션 / 무한 스크롤 fetch
+### 무엇을 예측?
 
-### AI 큐레이션 호출 (`main-curation.js`)
+종료된 경매의 `SOLD vs EXPIRED` 라벨로 학습한 이진 분류 모델. 진행 중(`ACTIVE`) 경매에
+"낙찰 확률 점수" 를 매겨 메인페이지 **"서두르세요! 곧 낙찰될 것 같아요!"** 슬롯의 Top-K 노출에 사용.
 
-페이지 진입 시 ML 서버 결과를 비동기로 받아 슬라이드에 채워 넣는다.
+### 학습 데이터 — BIDEO DB 직접 조회 (`train_real.py`)
 
-```javascript
-fetch('/api/prediction/curation?k=10', {
-    method: 'GET',
-    headers: { 'Accept': 'application/json' },
-    credentials: 'same-origin'
-})
-.then(res => res.ok ? res.json() : Promise.reject('HTTP ' + res.status))
-.then(render)
-.catch(handleError);
+기존 `train.py` 는 100% 합성 데이터로 학습되어 실제 BIDEO 분포와 어긋났음.
+실데이터 기반으로 전환.
 
-function render(data) {
-    track.innerHTML = data.items.map(buildCard).join('');
-    subEl.textContent = '진행 중 ' + data.total_active + '건 중 Top ' + data.items.length;
-}
+```sql
+SELECT a.id AS auction_id, a.starting_price,
+       extract(epoch FROM (a.closing_at - a.started_at))/3600.0 AS duration_hours,
+       extract(hour FROM a.started_at) AS started_hour,
+       extract(dow  FROM a.started_at) AS started_dow,
+       w.category, w.view_count, w.like_count, w.save_count, w.comment_count,
+       m.creator_verified,
+       (SELECT COUNT(*) FROM tbl_follow WHERE following_id = a.seller_id) AS creator_followers,
+       -- 작가 이력 (누설 방지: 현재 경매 id 이전만)
+       (SELECT COUNT(*) FROM tbl_auction p
+          WHERE p.seller_id = a.seller_id AND p.id < a.id
+            AND p.status IN ('SOLD','EXPIRED','CLOSED'))  AS prior_total,
+       (SELECT COUNT(*) FROM tbl_auction p
+          WHERE p.seller_id = a.seller_id AND p.id < a.id
+            AND p.status = 'SOLD')                         AS prior_sold,
+       (SELECT COUNT(*) FROM tbl_work w
+          WHERE w.member_id = a.seller_id AND w.deleted_datetime IS NULL) AS seller_n_works,
+       CASE WHEN a.status = 'SOLD' THEN 1 ELSE 0 END AS is_won
+  FROM tbl_auction a
+  LEFT JOIN tbl_work w ON w.id = a.work_id
+  LEFT JOIN tbl_member m ON m.id = a.seller_id
+ WHERE a.status IN ('SOLD','EXPIRED','CLOSED')
+   AND a.closing_at > a.started_at;
 ```
 
-ML 서버가 죽어도 페이지 자체는 동작해야 하므로 실패 시 섹션만 `hidden` 처리하고 다른 영역은 그대로 노출.
+종료된 경매 ~1,800건 / 양성률 ~38%.
 
-### 무한 스크롤 (`main.js`)
+### 피처
 
-`IntersectionObserver` 로 sentinel 요소가 보일 때 다음 페이지를 prepend 가 아닌 **append** 방식으로 추가.
+#### 기본
+- `price_log` — 가격(log1p, 낮을수록 낙찰 ↑)
+- `view_log`, `like_log`, `bookmark_log` — 작품 인기
+- `follower_log` — 작가 영향력
+- `creator_verified` — 인증 작가 0/1
+- `is_weekend`, `started_hour`, `started_dow` — 시간 파생
+- `work_category` (OneHot 22종)
 
-```javascript
-let observer = new IntersectionObserver((entries) => {
-    if (entries[0].isIntersecting && !loading && !ended) {
-        loading = true;
-        fetchNextPage().finally(() => { loading = false; });
-    }
-}, { rootMargin: "200px" });
-observer.observe(sentinel);
+#### 신규 파생 (`train_real.py`)
+- `prior_total_log`, `prior_sold_log`, `prior_sold_rate` — 작가의 직전 경매 이력 (누설 X)
+- `seller_n_works_log` — 활성 작품 수
+- `save_per_view`, `comment_per_view`, `like_per_view` — 인게이지먼트 비율
+
+### 모델
+
+DT (`GridSearchCV`) + RF (`n_estimators=500`) + GB (`n_estimators=400, lr=0.05, depth=4`) 3종 학습 후
+**AUC 최고 모델 자동 선택**.
+
+```python
+metrics = {'rf': {...}, 'gb': {...}}
+best_name = max(['rf','gb'], key=lambda k: metrics[k]['default_0_5']['auc'])
+joblib.dump({
+    'model_dt':     dtc,
+    'model_rf':     rfc if best_name == 'rf' else gbc,   # predictor 호환을 위해 동일 키
+    'features':     feature_columns,
+    'rf_threshold': best_thresh,
+    'cat_encoder':  cat_encoder,
+    'best_model':   best_name,
+}, out_path)
 ```
 
-`rootMargin: 200px` 로 화면 아래 200px 안에 들어오면 미리 호출 → 사용자 체감 끊김 X.
+### 결과
 
----
+| 단계 | AUC | F1 | acc |
+|---|---:|---:|---:|
+| 합성 모델을 BIDEO 시드에 그대로 적용 | 0.47 (랜덤 미만) | 0.65 (majority class) | 0.54 |
+| 실데이터 학습 (시드 약시그널) | 0.68 | 0.52 | 0.67 |
+| **+ 시드 강화 + 파생 피처 + GB** | **0.79** | **0.62** | **0.74** |
 
-## 3. 로그인 / 회원가입
+### 🔧 트러블슈팅 — "큐레이션 점수가 의미 없이 0.5 근처에서 흔들림"
 
-`SessionCreationPolicy.STATELESS` 로 세션 없이 **JWT (Access + Refresh)** 기반 인증.
+**증상**: 메인 큐레이션 Top-10 에 들쭉날쭉한 점수의 작품이 나옴. 모델의 변별력이 없어 보임.
 
-### JWT 발급 흐름
+**원인 1**: 합성 학습 시 가정한 분포와 실제 BIDEO 시드 분포 불일치.
+시그널이 있는 시드인 줄 알았으나 실측해보니 `SOLD/EXPIRED` 라벨이 `view/like/follower/verified` 와 거의 무상관.
 
-```java
-public void onAuthenticationSuccess(HttpServletRequest req, HttpServletResponse res,
-                                    Authentication auth) {
-    MemberVO member = (MemberVO) auth.getPrincipal();
-    jwtTokenProvider.createAccessToken(member.getEmail(), "LOCAL", res);
-    jwtTokenProvider.createRefreshToken(member.getEmail(), "LOCAL", res);
-    res.sendRedirect("/main");
-}
+| 피처 | not-SOLD 평균 | SOLD 평균 | lift |
+|---|---:|---:|---:|
+| starting_price | 78,299 | 78,051 | 1.00x |
+| view_count | 26.5 | 22.9 | **0.87x (역방향)** |
+| follower | 40.4 | 39.6 | 0.98x |
+| bid_count | 0.0 | 14.4 | ∞ (라벨 누설 — 사용 금지) |
+
+→ **재학습으로 해결 불가. 시드 자체를 고쳐야 했음.**
+
+**원인 2**: 시드 SQL 의 `quality_raw` 공식이 분산을 너무 좁게 만듦.
+
+```sql
+-- 기존 (deploy_setup.sql 원본)
+quality_raw = ln(v_cnt+1) + 1.5*ln(s_cnt+1) + 2.0*ln(f_cnt+1)
+SOLD 확률 = 0.15 + 0.70 * min(1, quality_raw / 18.0)
 ```
 
-- **Access Token**: 짧은 수명(30분), 매 요청마다 검증
-- **Refresh Token**: 긴 수명(2주), Redis 에 저장하여 탈취 시 무효화 가능
+대부분의 작품이 quality 13~15 → 확률 0.65~0.75 로 몰림 → 사실상 무작위.
 
-### 인증 필터
+**해결**: 시드 INSERT 로직을 **다중 피처 + 강한 가중치 + 약한 노이즈** 로 재설계.
 
-`AuthenticationFilter` 가 매 요청의 쿠키에서 토큰을 꺼내 검증 후 SecurityContext 에 주입.
-
-```java
-@Override
-protected void doFilterInternal(HttpServletRequest req, ...) {
-    String token = jwtTokenProvider.resolveToken(req);
-    if (token != null && jwtTokenProvider.validate(token)) {
-        Authentication auth = jwtTokenProvider.getAuthentication(token);
-        SecurityContextHolder.getContext().setAuthentication(auth);
-    }
-    chain.doFilter(req, res);
-}
+```sql
+update _auction_cand
+   set quality_logit =
+         -0.50
+         + 0.50 * (ln(v_cnt + 1) - 3.0)      -- view
+         + 0.65 * (ln(s_cnt + 1) - 2.0)      -- save
+         + 0.75 * (ln(f_cnt + 1) - 3.5)      -- follower
+         + 2.50 * verified                    -- creator_verified
+         - 1.00 * (ln(sp / 50000.0))         -- price ↓ → 낙찰 ↑
+         + case when category in ('SF','CINEMATIC','3D_ANIMATION',
+                                  'AI_GENERATED','디자인')   then  0.80
+                when category in ('포트폴리오','일상','패션') then -0.80
+                else 0.0 end                  -- 카테고리 효과
+         + case when extract(dow from started_at_t) >= 5 then 0.35 else 0.0 end
+         + r_noise;                           -- N(0, 0.17)
+update _auction_cand
+   set final_status = case
+     when r_state < 0.35 then 'ACTIVE'
+     when random() < (1.0 / (1.0 + exp(-quality_logit))) then 'SOLD'
+     else 'EXPIRED'
+   end;
 ```
 
-### SMS 본인 인증
+**결과**: AUC **0.47 → 0.79**.
 
-회원가입 시 Solapi 로 6자리 인증코드 발송 → Redis 에 5분 TTL 로 저장 → 검증.
+### 🔧 트러블슈팅 — 큐레이션에 마감된 경매가 노출됨
 
----
+**증상**: 메인 페이지 "곧 낙찰될 것 같아요!" 슬롯에 진행 중이 아닌 작품이 섞여 보임.
 
-## 4. 소셜 로그인 (OAuth 2.0)
+**원인**: ML 서버 큐레이션 쿼리가 `WHERE status='ACTIVE'` 만 보고 `closing_at` 시간 체크를 안 함.
+Spring 의 `AuctionClosureService` 가 10초 주기로 `closing_at <= now()` 인 ACTIVE 를 CLOSED 로 바꾸지만,
+그 사이의 좀비 경매가 큐레이션에 끼어듦.
 
-네이버 · 카카오 · 구글 통합 지원. `oauth2Login` + 커스텀 `CustomOAuth2UserService` + `OAuth2SuccessHandler` 조합.
+**해결**: 쿼리에 시간 필터 추가.
 
-### Provider 통합 처리
-
-각 provider 마다 응답 JSON 구조가 달라 `OAuth2Attribute` 로 정규화.
-
-```java
-public static OAuth2Attribute of(String provider, Map<String, Object> attributes) {
-    return switch (OAuthProvider.from(provider)) {
-        case KAKAO  -> ofKakao(attributes);
-        case NAVER  -> ofNaver(attributes);
-        case GOOGLE -> ofGoogle(attributes);
-    };
-}
+```python
+# api/repository/auction_repository.py
+WHERE a.status = 'ACTIVE'
+  AND a.closing_at > now()      # 좀비 차단
 ```
 
-### SuccessHandler 에서 회원 upsert
+### 추론 파이프라인
 
-OAuth 응답을 받아 기존 회원이면 `providerId` 매칭, 없으면 신규 생성 후 JWT 발급.
-
-```java
-public void onAuthenticationSuccess(...) {
-    OAuth2User oAuth2User = (OAuth2User) authentication.getPrincipal();
-    MemberVO member = authService.upsertOAuthMember(
-            oAuth2User.getAttribute("provider"),
-            oAuth2User.getAttribute("id"),
-            oAuth2User.getAttribute("email"),
-            oAuth2User.getAttribute("name"),
-            oAuth2User.getAttribute("profileImage")
-    );
-    jwtTokenProvider.createAccessToken(member.getEmail(), provider, response);
-    response.sendRedirect("/");
-}
+```
+Spring                                   FastAPI                           Postgres
+  │                                         │
+  └─ GET /api/prediction/curation?k=10 ─▶  │
+                                            │
+                                            ├─ Redis cache (TTL 30s) ─ hit? 즉시 반환
+                                            │
+                                            ├─ AuctionRepository.find_active_auctions
+                                            │     → 500건 + 모든 피처 일괄 join (1 쿼리)
+                                            │
+                                            ├─ predictor.featurize_batch
+                                            │     → log1p / 비율 / OneHot 변환
+                                            │
+                                            ├─ model_rf.predict_proba_batch
+                                            │     → 500건 < 1s
+                                            │
+                                            └─ Top-K 정렬 후 반환
 ```
 
-### 🔧 트러블슈팅 — 분산 환경 OAuth state 실종
+500건 추론도 1초 미만으로 끝나도록 **단건 N번이 아닌 배치 1번**으로 설계.
 
-**증상**: EC2 두 대 + nginx `least_conn` 환경에서 네이버 로그인 시 콜백 단계에서 에러 페이지로 이동.
+```python
+# 단순 단건 N번 (느림)
+[predictor.predict_proba(featurize(r)) for r in rows]
 
-**원인**: Spring Security 기본 `HttpSessionOAuth2AuthorizationRequestRepository` 가 OAuth state 를 **JVM 메모리** 에 저장. 콜백이 다른 EC2 로 가면 state 매칭 실패.
-
-**해결**: `AuthorizationRequestRepository` 를 직접 구현해 state 를 **HttpOnly + Secure 쿠키** 에 저장.
-
-```java
-@Override
-public void saveAuthorizationRequest(OAuth2AuthorizationRequest req,
-                                     HttpServletRequest request,
-                                     HttpServletResponse response) {
-    if (req == null) { deleteCookie(response); return; }
-    Cookie cookie = new Cookie(COOKIE_NAME, serialize(req));
-    cookie.setHttpOnly(true);
-    cookie.setSecure(true);
-    cookie.setPath("/");
-    cookie.setMaxAge(COOKIE_EXPIRE_SECONDS);
-    cookie.setAttribute("SameSite", "Lax");
-    response.addCookie(cookie);
-}
-```
-
-SecurityConfig 에 등록:
-
-```java
-.oauth2Login(oauth -> oauth
-    .authorizationEndpoint(authz -> authz
-        .authorizationRequestRepository(cookieOAuth2AuthorizationRequestRepository))
-    .userInfoEndpoint(userInfo -> userInfo.userService(customOAuth2UserService))
-    .successHandler(oAuth2SuccessHandler)
-)
-```
-
-**결과**: `STATELESS` 유지하면서 어떤 EC2 가 콜백 받아도 쿠키에서 state 복원. ip_hash 같은 우회 없이 정석 해결.
-
----
-
-## 5. 공통 레이아웃
-
-모든 페이지 공통의 헤더·사이드바·푸터·다크모드.
-
-### 다크/라이트 테마
-
-CSS 변수 기반. `<html data-theme="dark">` 속성 토글로 한 번에 전환.
-
-```css
-:root {
-    --bd-color-bg: #ffffff;
-    --bd-color-text: #1a1a1a;
-    --bd-color-accent: #6800EA;
-}
-
-:root[data-theme="dark"] {
-    --bd-color-bg: #0f0f0f;
-    --bd-color-text: #f5f5f5;
-    --bd-color-accent: #9D4EDD;
-}
-```
-
-JS 로 토글 + localStorage 에 저장.
-
-```javascript
-function toggleTheme() {
-    const next = html.dataset.theme === "dark" ? "light" : "dark";
-    html.dataset.theme = next;
-    localStorage.setItem("bd-theme", next);
-}
-```
-
-### 🔧 트러블슈팅 — 다크 모드 채팅 버블이 네모 박스로 표시됨
-
-**증상**: 다크모드에서 채팅 말풍선이 둥근 형태가 아닌 사각형 보라색 박스로 보임.
-
-**원인**: `.bd-chat-bubble--self` (그리드 컨테이너)에 잘못 `background-color: accent` 가 적용됨. 둥근 모서리(`border-radius`)는 자식 `.bd-chat-bubble__body` 에만 있는데 컨테이너에 색이 칠해져 바깥 영역까지 보라색이 번짐.
-
-**해결**: 컨테이너 배경을 `transparent` 로 변경, 색상은 `__body` 에만 유지.
-
-```css
-:root[data-theme="dark"] .bd-chat-bubble--self {
-    background: transparent !important;   /* 컨테이너는 색 X */
-}
-
-:root[data-theme="dark"] .bd-chat-bubble--self .bd-chat-bubble__body {
-    background: var(--bd-color-accent) !important;
-    border-radius: 18px;                  /* 진짜 버블에만 둥근 모서리 */
-}
+# 배치 1번 (운영 채택)
+X = predictor.featurize_batch(rows)
+scores = predictor.predict_proba_batch(X)
 ```
 
 ---
 
-## 6. 실시간 채팅
+## 2. 작가 팔로워 성장 회귀 (Regression)
 
-가장 복잡한 모듈. WebSocket + STOMP + RabbitMQ + 무한 스크롤 페이징을 종합.
+### 무엇을 예측?
 
-### 기본 구조
+마이페이지에서 **"12주 후 당신의 팔로워 수"** 를 보여주는 회귀 모델.
+
+### 🔧 트러블슈팅 — "0 작품 / 0 팔로워 신규 가입자에게 +46명 예측"
+
+**증상**: 작품 한 개도 안 올린 신규 사용자가 마이페이지에 들어가니 "12주 후 +46명" 표시.
+
+**원인**: 합성 학습 모델의 `forecast()` 가 **시간(week)과 등급(grade)** 만 보고 예측.
+
+```python
+# 기존 (train_growth.py + follower_growth_predictor.py)
+def forecast(grade, current_week, weeks=12):
+    m = models[grade]                              # grade 는 follower_count 만 보고 결정
+    pred = m.predict([[current_week + weeks]])[0]  # X = [target_week] 뿐!
+    return ...
+```
+
+- 사용자의 활동 (작품 수, 인게이지먼트) 을 전혀 보지 않음
+- "NEWCOMER 평균 성장 곡선" 을 누구에게나 동일 적용 → 활동 0 인 사람도 +46명
+
+→ **모델 디자인 문제**. 입력 자체를 재설계.
+
+### 해결 — 활동 피처 추가 + 실데이터 학습 (`train_growth_real.py`)
+
+#### 새 입력
+- `current_week_offset` — **첫 팔로워 이후** 경과 주 (가입 → 데뷔 기준 변경)
+- `current_followers`
+- `n_works` — 업로드 작품 수
+- `recent_velocity_4w` — 최근 4주간 팔로워 증감 (음수 가능)
+- `creator_verified`
+- `weeks_ahead` — 예측 horizon (4/8/12 주)
+
+#### 학습 데이터 — 실제 BIDEO follow 이벤트 재구성
+
+`tbl_follow.created_datetime` 으로 임의 시점 T 의 누적 follower 수를 정확히 계산 가능.
+
+```python
+def cum_count(events, until):
+    """정렬된 timestamp 리스트에서 until 이하 개수 (이분탐색)."""
+    lo, hi = 0, len(events)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if events[mid] <= until: lo = mid + 1
+        else:                    hi = mid
+    return lo
+```
+
+작가별로 데뷔(첫 팔로워) 후 4주 ~ (데이터끝 − ahead주) 구간에서 3개씩 스냅샷 샘플링 × ahead ∈ {4, 8, 12}
+→ **45,909 row** 학습 데이터셋.
+
+#### 모델
+
+`GradientBoostingRegressor(n_estimators=300, max_depth=4, learning_rate=0.05)`.
+
+### 결과
+
+| 항목 | 합성 (등급별 다항) | **실데이터 (GB)** |
+|---|---:|---:|
+| R² | ~0.19 ~ 0.85 (등급별) | **0.99** |
+| MAE | 수십 followers | **1.82** |
+| resid_std | 30 ~ 100 | **2.90** |
+
+피처 중요도 — `current_followers_log` 가 0.94 로 가장 큼. BIDEO 시드에서 follow 이벤트가 작품 활동과
+거의 독립이라 `n_works` 의 직접 효과는 작음. 그래도 **0 팔로워 → 거의 0 성장** 으로 정상 예측됨.
 
 ```
-[브라우저] ←SockJS+STOMP→ [Spring WebSocket /ws]
-                                    │
-                                    ▼
-                            [SimpleBroker (in-memory)]
-                                    │
-                                    └→ broadcast → 구독자 WebSocket
+0 작품 / 0 팔로워        →  +6명     (이전 모델: +46명)
+5 작품 / 10 팔로워       →  +10명
+30 작품 / 100 팔로워 / verified → +45명
+100 작품 / 500 팔로워 / verified → +90명
 ```
 
-`WebSocketConfig`:
+### API 컨트랙트 변경
+
+모델 입력이 늘었으므로 FastAPI Pydantic + Spring DTO + Spring 서비스 모두 갱신.
+
+```python
+# api/domain/follower_growth.py
+class FollowerGrowthRequest(BaseModel):
+    current_week_offset: int
+    current_followers:   int
+    weeks_ahead:         int = 12
+    n_works:             int = 0   # NEW
+    recent_velocity_4w:  int = 0   # NEW
+    creator_verified:    int = 0   # NEW
+```
+
+Spring 측 `FollowerGrowthService.forecastForMember(memberId)` 가 DB 에서 활동 피처를 채워 호출:
 
 ```java
-@Override
-public void registerStompEndpoints(StompEndpointRegistry registry) {
-    registry.addEndpoint("/ws")
-            .setAllowedOriginPatterns("*")
-            .withSockJS();
-}
+LocalDateTime debutAt = memberRepository.findFirstFollowAt(memberId).orElse(null);
+int weekOffset = debutAt == null ? 0 : weeksBetween(debutAt, now);
+int nWorks   = memberRepository.countActiveWorksByMemberId(memberId);
+int velocity = followers - memberRepository.countFollowersBefore(memberId, now.minusWeeks(4));
+int verified = Boolean.TRUE.equals(member.getCreatorVerified()) ? 1 : 0;
+
+return apiClient.forecast(FollowerGrowthRequestDTO.builder()
+        .currentWeekOffset(weekOffset)
+        .currentFollowers(followers)
+        .weeksAhead(12)
+        .nWorks(nWorks)
+        .recentVelocity4w(velocity)
+        .creatorVerified(verified)
+        .build());
 ```
 
-클라이언트:
+---
 
-```javascript
-let socket = new SockJS('/ws');
-stompClient = Stomp.over(socket);
-stompClient.connect({}, () => {
-    stompClient.subscribe('/topic/room.' + roomId, (frame) => {
-        handleRealtimeEvent(JSON.parse(frame.body));
-    });
-});
+## 3. 모델 서빙 (FastAPI)
+
+### 구조
+
+```
+api/
+├── main.py                 # FastAPI app + lifespan (모델 load/unload)
+├── database.py             # asyncpg pool
+├── cache.py                # Redis 래퍼
+├── router/
+│   ├── prediction.py       # /api/predictions/{predict, curation, ...}
+│   └── follower_growth.py  # /api/follower-growth/{forecast, forecast-curve}
+├── service/
+│   ├── prediction_service.py
+│   └── follower_growth_service.py
+├── repository/
+│   └── auction_repository.py
+├── ml/
+│   ├── predictor.py                  # joblib load + featurize/predict
+│   └── follower_growth_predictor.py
+└── domain/                # Pydantic 입출력 스키마
 ```
 
-### 🔧 트러블슈팅 1 — 분산 환경에서 메시지가 다른 EC2 사용자에게 안 감
+### Lifespan 으로 모델 한 번만 로드
 
-**증상**: User A (EC2 #1) 가 보낸 메시지가 같은 방의 User B (EC2 #2) 에게 도달하지 않음.
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    predictor.load()         # auction_classifier_v1.pkl
+    growth_predictor.load()  # creator_follower_growth_v1.pkl
+    await db.connect()
+    yield
+    await db.disconnect()
+```
 
-**원인**: `SimpleBroker` 는 JVM 인메모리. 인스턴스 간 메시지 공유 불가.
+→ 매 요청마다 18MB pkl 다시 안 읽음. 모델 교체 시 FastAPI 재시작이면 충분.
 
-**해결**: **RabbitMQ Fanout Exchange** 도입. 메시지를 `RabbitTemplate.convertAndSend()` 로 발행하면 모든 인스턴스의 `@RabbitListener` 가 수신 후 각자 자기 WebSocket 구독자에게 broadcast.
+### Redis 캐시
+
+큐레이션은 30초 TTL — 같은 사용자가 페이지 이동해도 ML 추론 부담 없음.
+
+```python
+CURATION_CACHE_TTL = 30
+async def get_curation(self, k=10, scan_limit=500):
+    key = f"curation:k={k}:scan={scan_limit}"
+    if cached := cache.get(key):
+        return CurationResponse(**json.loads(cached))
+    # ... 추론 ...
+    cache.setex(key, json.dumps(resp.model_dump()), ttl=CURATION_CACHE_TTL)
+```
+
+단일 `/predict` 는 입력 해시(MD5)를 키로 — 같은 경매 다시 물어도 즉시 반환.
+
+---
+
+## 4. Spring 연동
+
+`PredictionApiClient` (분류) + `FollowerGrowthApiClient` (회귀) 가 RestTemplate 으로 ML 서버 호출.
 
 ```java
-@Configuration
-public class RabbitConfig {
-    public static final String CHAT_EXCHANGE = "bideo.chat.exchange";
+@Component
+public class PredictionApiClient {
+    @Qualifier("mlApiRestTemplate") private final RestTemplate restTemplate;
+    @Value("${ml.api.base-url}") private String baseUrl;
 
-    @Bean
-    public FanoutExchange chatExchange() { return new FanoutExchange(CHAT_EXCHANGE); }
-
-    @Bean
-    public Queue chatQueue() { return new AnonymousQueue(); }   // 인스턴스별 임시 큐
-
-    @Bean
-    public Binding chatBinding(Queue q, FanoutExchange ex) {
-        return BindingBuilder.bind(q).to(ex);
-    }
-}
-```
-
-발행:
-
-```java
-private void publishRelay(String destination, Object payload) {
-    rabbitTemplate.convertAndSend(
-            RabbitConfig.CHAT_EXCHANGE, "",
-            ChatRelayMessage.builder()
-                    .destination(destination)
-                    .payload(payload)
-                    .build());
-}
-```
-
-수신:
-
-```java
-@RabbitListener(queues = "#{chatQueue.name}")
-public void onRelay(ChatRelayMessage relay) {
-    messagingTemplate.convertAndSend(relay.getDestination(), relay.getPayload());
-}
-```
-
-### 🔧 트러블슈팅 2 — 메시지 50개 초과 시 화면 미표시
-
-**증상**: 채팅 메시지가 50개 넘어가면 새로 들어온 메시지가 안 보임.
-
-**원인**: 매퍼가 `ORDER BY created_datetime ASC LIMIT 50` 으로 가장 오래된 50개만 반환. 클라이언트도 항상 page 0 호출.
-
-**해결 1**: 매퍼를 `DESC` 로 변경 → 최신 50개를 가져오고 서비스에서 reverse.
-
-```java
-List<MessageResponseDTO> messages = messageDAO.findByRoomId(roomId, memberId, page * 50, 50);
-Collections.reverse(messages);   // 화면은 시간순
-return messages;
-```
-
-**해결 2**: 클라이언트에 무한 스크롤 페이징 추가. 스크롤이 최상단 근처(80px 이내) 도달 시 page++ 호출 후 prepend, 스크롤 위치 보존.
-
-```javascript
-function loadMoreMessages() {
-    if (isLoadingMore || !activeRoomHasMore) return;
-    isLoadingMore = true;
-    let prevScrollHeight = messagesNode.scrollHeight;
-    let prevScrollTop    = messagesNode.scrollTop;
-
-    fetch(`/api/messages/rooms/${activeRoomId}/messages?page=${++activeRoomPage}`)
-        .then(r => r.json())
-        .then(messages => {
-            if (!messages.length) { activeRoomHasMore = false; return; }
-            room.messages = messages.concat(room.messages);   // prepend
-            renderMessages(room);
-            // 스크롤 위치 보정 (튀지 않게)
-            messagesNode.scrollTop = prevScrollTop +
-                (messagesNode.scrollHeight - prevScrollHeight);
-        })
-        .finally(() => { isLoadingMore = false; });
-}
-
-messagesNode.addEventListener('scroll', () => {
-    if (messagesNode.scrollTop < 80) loadMoreMessages();
-});
-```
-
-### 🔧 트러블슈팅 3 — 실시간 broadcast 가 페이징 상태를 망가뜨림
-
-**증상**: 옛 메시지 페이징해서 보고 있는 중 새 메시지가 오면 전체 reload 되어 page 0 으로 돌아감.
-
-**원인**: `handleRealtimeEvent` 가 새 이벤트 받을 때마다 `loadMessages` 로 전체 재호출.
-
-**해결**: broadcast 페이로드를 직접 활용. `CREATED` 는 append, `UPDATED`/`DELETED`/`LIKED` 는 in-place replace.
-
-```javascript
-function handleRealtimeEvent(event) {
-    let room = findRoom(activeRoomId);
-    if (event.type === "CREATED") {
-        room.messages.push(event.message);
-        renderMessages(room);
-        messagesNode.scrollTop = messagesNode.scrollHeight;
-    } else {
-        let idx = room.messages.findIndex(m => m.id === event.message.id);
-        if (idx >= 0) {
-            room.messages[idx] = event.message;
-            renderMessages(room);
-        }
+    public CurationResponseDTO getCuration(int k) {
+        String url = UriComponentsBuilder.fromHttpUrl(baseUrl + "/api/predictions/curation")
+                .queryParam("k", k).queryParam("scan_limit", 100)
+                .toUriString();
+        return restTemplate.getForObject(url, CurationResponseDTO.class);
     }
 }
+```
+
+### 🔧 트러블슈팅 — Spring 과 FastAPI 가 서로 다른 DB 를 봄
+
+**증상**: 큐레이션 카드를 클릭해 들어가니 "이 작품은 경매 중이 아닙니다" 표시. AI 가 추천한 작품이
+실제로는 경매 중이 아닌 사례 다수.
+
+**원인**: FastAPI 의 `api/.env` 에 `DATABASE_URL=postgresql://bideo:1234@localhost:5432/bideo`,
+Spring 의 yaml 은 `jdbc:postgresql://bideo.ai.kr:5432/bideo`. **서로 다른 DB**.
+FastAPI 로컬 DB 의 ACTIVE 가 EC2 DB 에선 이미 마감.
+
+**해결**: FastAPI `.env` 의 DSN 을 Spring 과 동일한 EC2 DB 로 통일.
+
+```diff
+- DATABASE_URL=postgresql://bideo:1234@localhost:5432/bideo
++ DATABASE_URL=postgresql://bideo:1234@bideo.ai.kr:5432/bideo
 ```
 
 ---
@@ -429,19 +412,27 @@ function handleRealtimeEvent(event) {
 ## 🎓 회고
 
 ### 잘한 점
-- **분산 환경의 무상태성**을 정석으로 풀어냄 — OAuth state는 쿠키로, 메시지는 RabbitMQ Fanout 으로
-- **사용자 체감 품질** 신경 — 무한 스크롤의 스크롤 위치 보존, 다크모드 CSS 변수, 비동기 페이지 끊김 없음
-- **인프라까지 보고 해결** — Spring 코드만이 아니라 nginx 설정, AWS 보안그룹, Cloudflare 영역도 함께 운영
+- **합성 → 실데이터** 로 전 과정 재정렬. AUC 0.47 → 0.79 / 회귀 "0작품 → +46명" 버그 → +6명으로 교정.
+- **시드 데이터 자체의 한계**를 인정하고 시드 SQL 부터 고침. "모델만 잘하면 된다" 가 아니었음.
+- **누설 없는 작가 이력 피처** (`prior_total/prior_sold` 의 `p.id < a.id` 조건) 로 데이터 누설 방지.
+- **모델 교체 = pkl 교체 + 재시작** — 인프라 변경 없이 운영 가능한 구조 유지.
 
 ### 아쉬운 점
-- **테스트 코드 부재** — JWT 필터·OAuth flow 같은 인증 로직은 통합 테스트가 꼭 필요
-- **WebSocket 부하 테스트 미실시** — 동시 채팅 1000명 같은 상황을 가정한 부하 테스트가 없음
+- BIDEO 시드 데이터가 본질적으로 합성이라 모델의 "최선" 이 시드 식을 역추론하는 수준에 머무름.
+  진짜 좋아지려면 production 사용자 로그가 누적된 후 다시 학습해야 함.
+- `n_works` 의 importance 가 거의 0 — 시드에서 `tbl_follow` 가 `tbl_work` 와 독립적으로 부여돼
+  "작품 많은 작가가 팔로워도 많다" 라는 자연 상관이 안 만들어짐. 시드 보강 여지.
+- LightGBM / XGBoost 미도입 — sklearn GB 만으로 AUC 0.79. 라이브러리 추가 시 1~3% 더 짤 가능성.
 
 ### 배운 점
-- **메모리에 있는 것은 모두 분산 환경의 적** — 세션·state·메시지 어느 것도 JVM 메모리에 두면 안 됨
-- **인프라 한 줄이 코드 100줄 보다 영향력 클 수 있다** — nginx `proxy_buffering off` 한 줄로 채팅 실시간 살아남, mkcert → Let's Encrypt 전환으로 OAuth 콜백 살아남
-- **사용자 흐름을 끝까지 따라가야 한다** — "메시지를 보낸다" 라는 한 액션 뒤에 직렬화·broker·구독자 분기·페이징 갱신 같은 7~8개 단계가 숨어있음
+- **모델은 데이터를 못 이긴다** — 합성 시그널이 약하면 RF 든 GB 든 다 0.5 근처에서 흔들림.
+  먼저 데이터부터 분석.
+- **누설(Leakage) 은 lift 의 모양으로 드러난다** — `bid_count` lift = ∞ 같은 비현실적 값이 보이면 학습 X.
+- **재학습은 모델 작업이 아니라 인프라 작업이기도 하다** — DTO, repository, predictor.featurize_batch,
+  Spring 서비스까지 같이 손대야 production 에 진짜로 반영됨.
+- **합성 데이터의 distribution 가정은 항상 의심해야** — view 가 1~3000 분포라고 학습한 모델이
+  실제로는 평균 23 인 데이터를 만났을 때 학습 가정이 깨짐.
 
 ---
 
-🔗 AI 서버 리포: [bideo-ai](https://github.com/your-org/bideo-ai)
+🔗 웹 페이지 단위 기능 문서: [README.md](../../../aws/workspace/bideo/README.md)
