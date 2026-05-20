@@ -1,6 +1,6 @@
 # 🤖 BIDEO AI — 모델 설계 & 운영 문서
 
-> 본 문서는 **BIDEO 의 ML 모델 (분류 + 회귀)** 을 어떻게 설계 / 학습 / 서빙했는지 코드와 함께 정리한 자료입니다.
+> 본 문서는 **BIDEO 의 ML / LLM 모델** 들을 어떻게 설계 / 학습 / 서빙했는지 코드와 함께 정리한 자료입니다.
 >
 > 웹 페이지 단위 기능은 별도 [README.md](../../../aws/workspace/bideo/README.md) 참조.
 
@@ -8,18 +8,33 @@
 
 ## 🙋 담당 모델 한눈에
 
-| 모델 | 분류 | 핵심 책임 |
+| 모델 | 분류 | 어디에 쓰이나? |
 |---|---|---|
-| [1. 경매 낙찰 분류](#1-경매-낙찰-분류-classification) | Classification (이진) | 메인 "AI PICK" 큐레이션 Top-K 점수 |
-| [2. 작가 팔로워 성장 회귀](#2-작가-팔로워-성장-회귀-regression) | Regression | 마이페이지 N 주 후 팔로워 예측 |
-| [3. 모델 서빙](#3-모델-서빙-fastapi) | Infra | FastAPI + asyncpg + Redis 캐시 |
-| [4. Spring 연동](#4-spring-연동) | Infra | RestTemplate + DTO 매핑 |
+| [1. 경매 낙찰 분류](#1-경매-낙찰-분류-classification) | Classification (이진) | 메인 "AI PICK" 큐레이션 Top-K |
+| [2. 작가 추천](#2-작가-추천-recommendation) | Item-CF (코사인 유사도) | 프로필 / 작품상세 / 탐색 페이지의 추천 작가 |
+| [3. 작가 팔로워 성장 회귀](#3-작가-팔로워-성장-회귀-regression) | Regression (GradientBoosting) | 마이페이지 N 주 후 팔로워 예측 |
+| [4. Vision LLM 작품 설명](#4-vision-llm-작품-설명-llm) | LLM (GPT-4o-mini) | 작품 등록 시 이미지 → 자연어 설명 |
+| [5. 비가시성 워터마크](#5-비가시성-워터마크-dwt-dct) | DWT-DCT 변환 | 작품 업로드 시 이미지/영상에 member_id 임베드 |
+| [6. 모델 서빙](#6-모델-서빙-fastapi) | Infra | FastAPI + asyncpg + Redis 캐시 |
+| [7. Spring 연동](#7-spring-연동) | Infra | RestTemplate / WebClient + DTO 매핑 |
+
+### 전체 흐름
 
 ```
-[Spring (web)] → /api/prediction/* → [FastAPI (ML)] → joblib 모델 + Postgres
-                                          ↑
-                                  Redis cache (TTL 30s)
+                  ┌───────────────────────────────────────────────────┐
+                  │  FastAPI (ML 서버)                                 │
+[Spring (web)] ─▶ │  ├─ /api/predictions  ── auction_classifier      │ ─▶  Postgres (BIDEO DB)
+                  │  ├─ /api/recommend    ── creator_recommender     │
+                  │  ├─ /api/growth       ── follower_growth_predictor│
+                  │  ├─ /api/llm/describe ── OpenAI GPT-4o-mini      │ ─▶  OpenAI API
+                  │  └─ /api/watermark    ── DWT-DCT (imwatermark)   │
+                  └───────────────────────────────────────────────────┘
+                                     ↑
+                            Redis cache (TTL 30s)
 ```
+
+> 리포에 `/api/embed` (텍스트 임베딩) 도 있지만 현재 Spring 측에서 호출하지 않아 본 문서에서는
+> 다루지 않습니다 (추후 시맨틱 검색 도입 시 연결 예정).
 
 ---
 
@@ -177,7 +192,7 @@ WHERE a.status = 'ACTIVE'
 ```
 Spring                                   FastAPI                           Postgres
   │                                         │
-  └─ GET /api/prediction/curation?k=10 ─▶  │
+  └─ GET /api/predictions/curation?k=10 ─▶ │
                                             │
                                             ├─ Redis cache (TTL 30s) ─ hit? 즉시 반환
                                             │
@@ -206,7 +221,84 @@ scores = predictor.predict_proba_batch(X)
 
 ---
 
-## 2. 작가 팔로워 성장 회귀 (Regression)
+## 2. 작가 추천 (Recommendation)
+
+### 무엇을 추천?
+
+로그인 사용자가 follow 할 만한 작가 (Top-K) + 특정 작가와 **비슷한 작가**.
+프로필 페이지, 작품 상세 페이지의 "이런 작가도 어때요?" 영역, 탐색 페이지에서 사용.
+
+### 알고리즘 — Item-Item CF (코사인 유사도)
+
+기성 외부 모델 없이 **사용자×작가 follow 희소행렬** 에서 작가×작가 유사도를 직접 계산.
+
+```python
+# api/ml/creator_recommender.py
+from scipy.sparse import csr_matrix
+from sklearn.metrics.pairwise import cosine_similarity
+
+# 1. tbl_follow → 사용자×작가 희소행렬 (n_users × n_creators)
+self.ui_matrix = csr_matrix((data, (rows, cols)), shape=(n_users, n_creators))
+
+# 2. 작가×작가 코사인 유사도 — 대칭 ndarray
+self.item_sim = cosine_similarity(self.ui_matrix.T)
+```
+
+FastAPI **startup 시 한 번** 계산해 메모리에 보관 → 추천 요청은 행렬 lookup 만 하므로 매우 빠름.
+
+### Cold Start 처리
+
+follow 이력이 0건이거나 모델에 없는 신규 사용자: **`follower_count` 내림차순 인기 작가 Top-K** 반환.
+
+```python
+async def recommend_for_user(user_id, k):
+    if user_id not in self.user_to_idx:
+        return self.popular_creators[:k]   # cold start fallback
+    # 정상 케이스: 본인이 follow 한 작가들의 평균 유사도 → Top-K
+    user_idx = self.user_to_idx[user_id]
+    user_vec = self.ui_matrix[user_idx].toarray().ravel()
+    scores = self.item_sim @ user_vec
+    scores[user_vec > 0] = -np.inf   # 이미 follow 한 작가 제외
+    return [self.idx_to_creator[i] for i in scores.argsort()[::-1][:k]]
+```
+
+### `growth_weight` — 인기/성장 가중치 결합
+
+순수 CF 만 쓰면 인기 있는 작가가 항상 상위. 신예 작가에게도 기회를 주려면 **CF 점수 + (1-α) × 성장률** 같은 형태로 섞는 옵션 제공.
+
+```
+GET /api/recommend/creators/me?user_id=42&k=10&growth_weight=0.3
+```
+
+기본 `0.0` 은 순수 CF, `1.0` 은 성장률 기준만.
+
+### 엔드포인트
+
+| 메소드 | URL | 설명 |
+|---|---|---|
+| GET | `/api/recommend/creators/me?user_id=&k=` | 본인 맞춤 추천 |
+| GET | `/api/recommend/creators/similar/{creator_id}?k=` | 특정 작가와 비슷한 작가 |
+| GET | `/api/recommend/health` | 모델 로드 / 행렬 크기 헬스체크 |
+
+### Spring 연동
+
+`RecommendationApiClient` 에서 단순 GET 호출.
+
+```java
+String url = UriComponentsBuilder.fromHttpUrl(baseUrl + "/api/recommend/creators/me")
+        .queryParam("user_id", userId)
+        .queryParam("k", k)
+        .queryParam("growth_weight", growthWeight)
+        .toUriString();
+return restTemplate.getForObject(url, CreatorRecommendationResponseDTO.class);
+```
+
+`/api/recommend/creators/similar/**` 는 SecurityConfig 에서 `permitAll()` — 비로그인 사용자도 작품 상세에서
+"비슷한 작가" 를 볼 수 있도록 의도적 공개.
+
+---
+
+## 3. 작가 팔로워 성장 회귀 (Regression)
 
 ### 무엇을 예측?
 
@@ -317,7 +409,188 @@ return apiClient.forecast(FollowerGrowthRequestDTO.builder()
 
 ---
 
-## 3. 모델 서빙 (FastAPI)
+## 4. Vision LLM 작품 설명 (LLM)
+
+### 무엇을 만들어내나?
+
+작품 등록 플로우에서 업로드된 이미지(영상의 경우 썸네일) 를 OpenAI **GPT-4o-mini** 의 Vision API 에
+태워서 한국어 5~7문장의 설명을 받아낸다. 받은 텍스트는 `tbl_work.llm_answer` 에 저장 → 향후 시맨틱 검색
+인덱스로 합쳐질 예정.
+
+### 프롬프트 설계
+
+검색 인덱스용이라 **묘사 키워드가 풍부할수록 좋음**. 사실 추측은 금지.
+
+```python
+_SYSTEM_PROMPT = (
+    "당신은 미술/디자인 작품 큐레이터입니다. "
+    "주어진 이미지를 한국어로 5~7문장 분량의 한 문단으로 묘사하세요. "
+    "주요 피사체, 색감, 분위기, 스타일(예: 미니멀, 사이버펑크, 수채화 등), "
+    "구도, 떠오르는 감정 키워드를 포함하세요. "
+    "단정적인 사실(작가명, 연도 등) 추측은 하지 마세요."
+)
+```
+
+### 호출 — base64 data URL 직접 전달
+
+OpenAI Vision 은 `image_url` 필드에 외부 URL 대신 base64 data URL 도 받아주므로 S3 업로드 없이 즉시 호출 가능.
+
+```python
+b64 = base64.b64encode(image_bytes).decode("ascii")
+data_url = f"data:{mime};base64,{b64}"
+
+completion = await client.chat.completions.create(
+    model="gpt-4o-mini",
+    max_tokens=400, temperature=0.4,
+    messages=[
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]},
+    ],
+)
+```
+
+### Graceful Degradation — LLM 실패가 작품 등록을 막지 않음
+
+LLM 호출은 **부가 기능**이지 등록의 핵심 흐름이 아니므로 어떤 실패가 나도 작품 등록은 계속.
+실패 시그널은 두 층에서 처리:
+
+**FastAPI** — 환경 미설정 (OPENAI_API_KEY 누락 등) 은 503 으로 Spring 에 명확히 알림.
+
+```python
+try:
+    return await llm_describe_service.describe(image_bytes, content_type, title)
+except RuntimeError as e:    # 설정 누락
+    raise HTTPException(status_code=503, detail=str(e))
+except Exception as e:        # 기타
+    raise HTTPException(status_code=500, detail=str(e))
+```
+
+**Spring** — `WebClient + Mono.empty()` 패턴으로 어떤 에러든 빈 결과로 흡수.
+
+```java
+return mlApiWebClient.post()
+        .uri("/api/llm/describe")
+        ...
+        .onErrorResume(e -> {
+            log.warn("[LLM] describe 호출 실패 (작품 등록은 계속 진행): {}", e.getMessage());
+            return Mono.empty();
+        });
+```
+
+작품 등록 서비스는 `.blockOptional()` 로 받아서 `null` 이면 `llm_answer` 만 비워두고 나머지 컬럼은 정상 저장.
+
+### 비용 / 모델 선택
+
+- **gpt-4o-mini**: 이미지 1장 + 짧은 텍스트 응답 → 1요청 약 $0.0005 (BIDEO 트래픽에선 충분히 저렴)
+- `max_tokens=400` 으로 응답 길이 캡 — 시맨틱 검색에 무한히 긴 텍스트는 오히려 노이즈
+- `temperature=0.4` — 사실 묘사라 약간만 다양성 부여, 너무 자유로우면 환각 위험
+
+### 엔드포인트
+
+| 메소드 | URL | Body | 응답 |
+|---|---|---|---|
+| POST | `/api/llm/describe` | multipart: `image` (필수), `title` (선택) | `{"description": "...", "model": "gpt-4o-mini"}` |
+
+---
+
+## 5. 비가시성 워터마크 (DWT-DCT)
+
+### 무엇을 박나?
+
+작품 업로드 시점에 **이미지/영상에 사람 눈에 안 보이는 워터마크** 를 박는다. payload 는 업로드한
+회원의 `member_id` 를 8바이트 zero-pad 한 문자열. 추후 저작권 분쟁 시 작품에서 payload 를 추출해
+원본 업로더를 식별.
+
+### 알고리즘 — DWT-DCT (`imwatermark` 라이브러리)
+
+이미지: Y 채널에 대해 **DWT(이산 웨이블릿) → DCT(이산 코사인) → 페이로드 비트 embed**.
+영상: 키프레임만 같은 방식으로 처리 후 재인코딩.
+
+| 특성 | 값 |
+|---|---|
+| Payload | 8 byte (member_id 0-pad) |
+| 알고리즘 | `dwtDct` (필요 시 `dwtDctSvd`, `rivaGan` 비교 가능 — `/selftest/compare`) |
+| PSNR | 38~45 dB (40 이상이면 사람 눈에 거의 안 보임) |
+| 강건성 | PNG re-encode 후 추출 가능, JPEG 75 ↑ 까지 견딤 |
+
+### 엔드포인트
+
+| 메소드 | URL | Body | 응답 |
+|---|---|---|---|
+| POST | `/api/watermark/embed` | multipart: `image`, `payload` | StreamingResponse (image/png 또는 video/mp4) + `X-Watermark-Output-Ext` 헤더 |
+| POST | `/api/watermark/extract` | multipart: `image` | `{payload, valid, raw_hex}` |
+| POST | `/api/watermark/selftest` | multipart: `image`, `payload?` | embed→extract 라운드트립 검증 |
+| GET | `/api/watermark/selftest/synthetic` | `payload?` | 입력 없이 합성 노이즈로 라운드트립 진단 |
+| POST | `/api/watermark/selftest/compare` | multipart: `image`, `payload?` | 알고리즘별(Y scale 7종 + rivaGan) PSNR / 추출률 비교 |
+
+### Spring 연동 — `WatermarkApiClient` (WebClient + Mono)
+
+작품 등록 플로우(`WorkService.write`) 에서 **S3 업로드 직전에** 호출. 결과 bytes 와
+응답 헤더 `X-Watermark-Output-Ext` 를 그대로 S3 키 확장자로 사용.
+
+```java
+// WatermarkApiClient.embed — LLM 클라이언트와 동일한 graceful degradation 패턴
+public Mono<WatermarkedFile> embed(MultipartFile file, Long memberId) {
+    String payload = String.format("%08d", memberId % 100_000_000L);
+    MultipartBodyBuilder builder = new MultipartBodyBuilder();
+    builder.part("image", asFilePart(file)).contentType(parseContentType(file));
+    builder.part("payload", payload);
+
+    return mlApiWebClient.post()
+            .uri("/api/watermark/embed")
+            .contentType(MediaType.MULTIPART_FORM_DATA)
+            .body(BodyInserters.fromMultipartData(builder.build()))
+            .exchangeToMono(response -> {
+                if (!response.statusCode().is2xxSuccessful()) {
+                    return response.releaseBody().then(Mono.empty());
+                }
+                String ext = response.headers().header("X-Watermark-Output-Ext")
+                        .stream().findFirst().orElse(null);
+                String ct = response.headers().contentType()
+                        .map(MediaType::toString).orElse(MediaType.APPLICATION_OCTET_STREAM_VALUE);
+                return response.bodyToMono(byte[].class)
+                        .map(bytes -> new WatermarkedFile(bytes, ext, ct));
+            })
+            .onErrorResume(e -> Mono.empty());   // 실패 시 원본 업로드로 fallback
+}
+```
+
+### WorkService 내 흐름 (전후 비교)
+
+```java
+// Before — 원본 그대로 S3
+String key = s3FileService.upload("works", mediaFile);
+
+// After — 워터마크 시도 → 성공 시 워터마크 bytes 업로드 / 실패 시 원본 업로드
+WatermarkedFile wm = watermarkApiClient.embed(mediaFile, ownerId)
+        .blockOptional(Duration.ofSeconds(60))
+        .orElse(null);
+String key = (wm != null && wm.bytes() != null)
+        ? s3FileService.upload("works", wm.bytes(), wm.contentType(), wm.ext())
+        : s3FileService.upload("works", mediaFile);
+```
+
+이미지 / 영상 / 썸네일 모두 동일 경로로 워터마킹. 워터마크 실패는 작품 등록을 막지 않음 (`Mono.empty()` 흡수 + 원본 fallback).
+
+### 🔧 트러블슈팅 — 영상 워터마크의 느린 응답
+
+**증상**: 20MB 짜리 영상 업로드 시 워터마크 단계에서 30초 timeout 초과 → 원본 fallback.
+
+**원인**: DWT-DCT 가 모든 키프레임에 적용되므로 영상 길이/해상도에 비례. FastAPI 측 `embed_video` 가
+ffmpeg re-encode 까지 포함하면 1080p 30초 클립이 20~40초 걸림.
+
+**현재 대응**: Spring 측 block timeout 을 30s → 60s 로 증가 (`Duration.ofSeconds(60)`).
+graceful degradation 이라 timeout 발생해도 원본 그대로 업로드되어 사용자 흐름은 안 끊김.
+
+**근본 해결 (TODO)**: 워터마크를 업로드 직후 동기 처리 대신 RabbitMQ 큐에 태우는 비동기 처리로 전환.
+업로드 응답은 즉시 반환하고, 백그라운드 워커가 워터마크 박은 새 파일로 S3 키만 교체.
+
+---
+
+## 6. 모델 서빙 (FastAPI)
 
 ### 구조
 
@@ -328,14 +601,16 @@ api/
 ├── cache.py                # Redis 래퍼
 ├── router/
 │   ├── prediction.py       # /api/predictions/{predict, curation, ...}
-│   └── follower_growth.py  # /api/follower-growth/{forecast, forecast-curve}
+│   ├── recommendation.py   # /api/recommend/{creators/me, creators/similar/{id}}
+│   ├── follower_growth.py  # /api/growth/{forecast, forecast/curve}
+│   ├── llm.py              # /api/llm/describe
+│   ├── watermark.py        # /api/watermark   (작품 업로드 시 자동 호출)
+│   └── embedding.py        # /api/embed       (현재 미연동)
 ├── service/
-│   ├── prediction_service.py
-│   └── follower_growth_service.py
 ├── repository/
-│   └── auction_repository.py
 ├── ml/
-│   ├── predictor.py                  # joblib load + featurize/predict
+│   ├── predictor.py                  # auction joblib load + featurize/predict
+│   ├── creator_recommender.py        # startup 시 CF 행렬 빌드
 │   └── follower_growth_predictor.py
 └── domain/                # Pydantic 입출력 스키마
 ```
@@ -345,14 +620,16 @@ api/
 ```python
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    predictor.load()         # auction_classifier_v1.pkl
-    growth_predictor.load()  # creator_follower_growth_v1.pkl
+    predictor.load()               # auction_classifier_v1.pkl
+    growth_predictor.load()        # creator_follower_growth_v1.pkl
+    await creator_recommender.load()  # tbl_follow → CF 행렬 in-memory
     await db.connect()
     yield
     await db.disconnect()
 ```
 
-→ 매 요청마다 18MB pkl 다시 안 읽음. 모델 교체 시 FastAPI 재시작이면 충분.
+→ 매 요청마다 18MB pkl 다시 안 읽음. CF 행렬도 startup 시 1회만 빌드 (재학습 X).
+모델/행렬 교체 시 FastAPI 재시작이면 충분.
 
 ### Redis 캐시
 
@@ -370,13 +647,18 @@ async def get_curation(self, k=10, scan_limit=500):
 
 단일 `/predict` 는 입력 해시(MD5)를 키로 — 같은 경매 다시 물어도 즉시 반환.
 
+LLM `/describe` 는 의도적으로 캐싱 안 함 — 같은 이미지가 다시 올라올 일이 거의 없고, base64 키가 너무 큼.
+
 ---
 
-## 4. Spring 연동
+## 7. Spring 연동
 
-`PredictionApiClient` (분류) + `FollowerGrowthApiClient` (회귀) 가 RestTemplate 으로 ML 서버 호출.
+`PredictionApiClient` / `RecommendationApiClient` / `FollowerGrowthApiClient` 는 **RestTemplate** 으로
+동기 호출. `LlmDescribeApiClient` 는 **WebClient + Mono** 로 비동기 + 우아한 실패 처리 (multipart 업로드라
+backpressure 가 의미 있고 등록 흐름이 reactive 친화적).
 
 ```java
+// 동기 — 큐레이션
 @Component
 public class PredictionApiClient {
     @Qualifier("mlApiRestTemplate") private final RestTemplate restTemplate;
@@ -389,6 +671,8 @@ public class PredictionApiClient {
         return restTemplate.getForObject(url, CurationResponseDTO.class);
     }
 }
+
+// 비동기 + 실패 흡수 — LLM (위 4번 섹션 코드 참조)
 ```
 
 ### 🔧 트러블슈팅 — Spring 과 FastAPI 가 서로 다른 DB 를 봄
@@ -412,16 +696,23 @@ FastAPI 로컬 DB 의 ACTIVE 가 EC2 DB 에선 이미 마감.
 ## 🎓 회고
 
 ### 잘한 점
-- **합성 → 실데이터** 로 전 과정 재정렬. AUC 0.47 → 0.79 / 회귀 "0작품 → +46명" 버그 → +6명으로 교정.
+- **합성 → 실데이터** 로 전 과정 재정렬. 경매 AUC 0.47 → 0.79 / 회귀 "0작품 → +46명" 버그 → +6명으로 교정.
 - **시드 데이터 자체의 한계**를 인정하고 시드 SQL 부터 고침. "모델만 잘하면 된다" 가 아니었음.
 - **누설 없는 작가 이력 피처** (`prior_total/prior_sold` 의 `p.id < a.id` 조건) 로 데이터 누설 방지.
 - **모델 교체 = pkl 교체 + 재시작** — 인프라 변경 없이 운영 가능한 구조 유지.
+- **추천은 CF 코사인 행렬을 in-memory** 로 두고 cold-start 는 인기 fallback — 외부 라이브러리 없이 간단·빠름.
+- **LLM 실패는 작품 등록을 막지 않게** — WebClient `onErrorResume(Mono.empty)` + Spring `blockOptional()` 로
+  부가 기능의 등급을 정확히 표현.
 
 ### 아쉬운 점
 - BIDEO 시드 데이터가 본질적으로 합성이라 모델의 "최선" 이 시드 식을 역추론하는 수준에 머무름.
   진짜 좋아지려면 production 사용자 로그가 누적된 후 다시 학습해야 함.
-- `n_works` 의 importance 가 거의 0 — 시드에서 `tbl_follow` 가 `tbl_work` 와 독립적으로 부여돼
-  "작품 많은 작가가 팔로워도 많다" 라는 자연 상관이 안 만들어짐. 시드 보강 여지.
+- 추천 CF 행렬을 **startup 1회** 만 빌드 → 새 follow 가 실시간 반영되진 않음. 트래픽 적어 현재는 OK,
+  대규모 운영 시 incremental 업데이트 필요.
+- 워터마크는 작품 업로드에 연결했지만 **영상은 동기 처리라 1080p 30초 클립 기준 20~40초**
+  소요. RabbitMQ 큐로 옮겨 비동기 처리 + S3 키 교체 패턴으로 전환 필요.
+- 시맨틱 검색용 임베딩(`/api/embed`) 라우터는 만들어두고 아직 웹에 연결 안 함.
+  LLM 설명(`tbl_work.llm_answer`) 과 결합해야 진가를 발휘하므로 다음 마일스톤.
 - LightGBM / XGBoost 미도입 — sklearn GB 만으로 AUC 0.79. 라이브러리 추가 시 1~3% 더 짤 가능성.
 
 ### 배운 점
@@ -430,6 +721,7 @@ FastAPI 로컬 DB 의 ACTIVE 가 EC2 DB 에선 이미 마감.
 - **누설(Leakage) 은 lift 의 모양으로 드러난다** — `bid_count` lift = ∞ 같은 비현실적 값이 보이면 학습 X.
 - **재학습은 모델 작업이 아니라 인프라 작업이기도 하다** — DTO, repository, predictor.featurize_batch,
   Spring 서비스까지 같이 손대야 production 에 진짜로 반영됨.
+- **LLM 부가 기능은 실패 흡수 채널이 핵심** — 핵심 흐름과 부가 흐름의 등급을 명확히 분리.
 - **합성 데이터의 distribution 가정은 항상 의심해야** — view 가 1~3000 분포라고 학습한 모델이
   실제로는 평균 23 인 데이터를 만났을 때 학습 가정이 깨짐.
 
